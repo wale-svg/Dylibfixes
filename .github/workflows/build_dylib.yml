@@ -26,6 +26,7 @@ jobs:
 
           static struct sigaction old_sigsegv;
           static char g_log_path[1024] = {0};
+          static uint8_t g_dummy_buffer[1024] = {0};
 
           static void write_diag_log(const char *msg) {
               if (g_log_path[0] == '\0') return;
@@ -55,51 +56,20 @@ jobs:
               _STRUCT_ARM_THREAD_STATE64 *ts = &uc->uc_mcontext->__ss;
 
               uintptr_t pc = arm_thread_state64_get_pc(*ts);
+              uint32_t inst_word = 0;
+
+              if (safe_read_uint32(pc, &inst_word) && inst_word == 0xf9400288 && ts->__x[20] == 0) {
+                  write_diag_log("[NX_PATCH] Caught null pointer dereference at x20! Patching with dummy buffer...\n");
+                  ts->__x[20] = (uint64_t)g_dummy_buffer;
+                  return;
+              }
+
               uintptr_t lr = arm_thread_state64_get_lr(*ts);
-              uintptr_t sp = arm_thread_state64_get_sp(*ts);
-              uintptr_t fp = arm_thread_state64_get_fp(*ts);
               uintptr_t fault_addr = (uintptr_t)info->si_addr;
 
-              char buf[4096];
-              int off = 0;
-
-              off += snprintf(buf + off, sizeof(buf) - off,
-                  "\n=== NX_DIAG SIGSEGV INTERCEPTED ===\n"
-                  "fault_addr = 0x%lx\n"
-                  "pc         = 0x%lx\n"
-                  "lr         = 0x%lx\n"
-                  "sp         = 0x%lx\n"
-                  "fp         = 0x%lx\n",
-                  fault_addr, pc, lr, sp, fp);
-
-              for (int i = 0; i < 29; i++) {
-                  off += snprintf(buf + off, sizeof(buf) - off, "x%-2d = 0x%016llx%s",
-                                  i, ts->__x[i], (i % 2 == 1) ? "\n" : "  ");
-              }
-              off += snprintf(buf + off, sizeof(buf) - off, "\n\n--- Instruction Window around PC ---\n");
-
-              for (int delta = -32; delta <= 32; delta += 4) {
-                  uintptr_t inst_addr = pc + delta;
-                  uint32_t word = 0;
-                  if (safe_read_uint32(inst_addr, &word)) {
-                      off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (pc%+d): 0x%08x\n",
-                                      (delta == 0) ? ">>>" : "   ", inst_addr, delta, word);
-                  } else {
-                      off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (pc%+d): <unreadable>\n",
-                                      (delta == 0) ? ">>>" : "   ", inst_addr, delta);
-                  }
-              }
-
-              off += snprintf(buf + off, sizeof(buf) - off, "\n--- Instruction Window around LR ---\n");
-              for (int delta = -24; delta <= 16; delta += 4) {
-                  uintptr_t inst_addr = lr + delta;
-                  uint32_t word = 0;
-                  if (safe_read_uint32(inst_addr, &word)) {
-                      off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (lr%+d): 0x%08x\n",
-                                      (delta == 0) ? ">>>" : "   ", inst_addr, delta, word);
-                  }
-              }
-
+              char buf[512];
+              snprintf(buf, sizeof(buf), "\n=== UNHANDLED SIGSEGV ===\nfa=0x%lx pc=0x%lx lr=0x%lx x20=0x%llx\n",
+                       fault_addr, pc, lr, ts->__x[20]);
               write_diag_log(buf);
 
               if (old_sigsegv.sa_flags & SA_SIGINFO) {
@@ -121,7 +91,7 @@ jobs:
                   strncpy(g_log_path, fullPath.UTF8String, sizeof(g_log_path) - 1);
               }
 
-              write_diag_log("=== nx_diag loaded ===\n");
+              write_diag_log("=== nx_patch loaded ===\n");
 
               struct sigaction sa;
               memset(&sa, 0, sizeof(sa));
@@ -131,7 +101,7 @@ jobs:
 
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                   sigaction(SIGSEGV, &sa, &old_sigsegv);
-                  write_diag_log("SIGSEGV wrapper installed.\n");
+                  write_diag_log("SIGSEGV patch handler installed.\n");
               });
           }
           EOF
