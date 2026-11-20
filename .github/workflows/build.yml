@@ -1,4 +1,4 @@
-name: Build SymDump dylib
+name: Build Trace dylib
 
 on:
   workflow_dispatch:
@@ -16,82 +16,218 @@ jobs:
         shell: bash
         run: |
           mkdir -p tweak
-          cat > tweak/symdump.c <<'EOF'
-          // Diagnostic: on load, writes the symbols of the app's own images to
-          // <HOME>/Documents/tweak_symbols.txt (addresses are unslid; slide is
-          // printed per image). Does not modify anything.
+
+          # 512 generated hook slots (one replacement function per hooked symbol)
+          {
+            for i in $(seq 0 511); do echo "SLOT($i)"; done
+            echo "static void *HK[512] = {"
+            for i in $(seq 0 511); do echo "  hk$i,"; done
+            echo "};"
+          } > tweak/slots.inc
+
+          cat > tweak/trace.c <<'EOF'
+          // Traces calls to the host's emulated Switch-service functions.
+          // Output: <HOME>/Documents/tweak_trace.txt (one line per call, written
+          // immediately so the last lines survive a crash). Each function logs
+          // only its first PER_FN_LOG calls.
           #include <mach-o/dyld.h>
           #include <mach-o/loader.h>
           #include <mach-o/nlist.h>
+          #include <mach/mach.h>
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <stdarg.h>
           #include <stdio.h>
+          #include <stdlib.h>
           #include <string.h>
           #include <stdint.h>
-          #include <stdlib.h>
+          #include <unistd.h>
+
+          #define MAXSLOTS 512
+          #define PER_FN_LOG 40
+
+          typedef uint64_t (*fn8)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t, uint64_t, uint64_t, uint64_t);
+          typedef void (*MSHook_t)(void *, void *, void **);
+
+          static fn8 ORIG[MAXSLOTS];
+          static const char *NAME[MAXSLOTS];
+          static volatile int COUNT[MAXSLOTS];
+          static volatile long g_seq;
+          static int g_fd = -1;
+
+          static void logf_(const char *fmt, ...) {
+              char b[768];
+              va_list ap;
+              va_start(ap, fmt);
+              int n = vsnprintf(b, sizeof b, fmt, ap);
+              va_end(ap);
+              if (n <= 0 || g_fd < 0) return;
+              if (n >= (int)sizeof b) n = (int)sizeof b - 1;
+              write(g_fd, b, (size_t)n);
+          }
+
+          // If p points at readable memory starting with printable text, show it.
+          static void peek(char *out, size_t cap, uint64_t p) {
+              out[0] = 0;
+              if (p < 0x10000 || p > 0x7fffffffffffULL) return;
+              char tmp[40];
+              vm_size_t got = 0;
+              if (vm_read_overwrite(mach_task_self(), (vm_address_t)p, 32,
+                                    (vm_address_t)tmp, &got) != KERN_SUCCESS
+                  || got < 4) return;
+              size_t n = 0;
+              while (n < got && tmp[n] >= 32 && tmp[n] < 127) n++;
+              if (n >= 3) snprintf(out, cap, " \"%.*s\"", (int)n, tmp);
+          }
+
+          static uint64_t trace(int n, uint64_t a0, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5,
+                                uint64_t a6, uint64_t a7) {
+              int c = __sync_add_and_fetch(&COUNT[n], 1);
+              long s = 0;
+              unsigned tid = (unsigned)pthread_mach_thread_np(pthread_self());
+              if (c <= PER_FN_LOG) {
+                  s = __sync_add_and_fetch(&g_seq, 1);
+                  char p0[56], p1[56];
+                  peek(p0, sizeof p0, a0);
+                  peek(p1, sizeof p1, a1);
+                  logf_("#%ld t%x > %s(0x%llx%s, 0x%llx%s, 0x%llx, 0x%llx)\n",
+                        s, tid, NAME[n],
+                        (unsigned long long)a0, p0,
+                        (unsigned long long)a1, p1,
+                        (unsigned long long)a2, (unsigned long long)a3);
+              }
+              uint64_t r = ORIG[n](a0, a1, a2, a3, a4, a5, a6, a7);
+              if (c <= PER_FN_LOG)
+                  logf_("#%ld t%x < %s = 0x%llx\n", s, tid, NAME[n],
+                        (unsigned long long)r);
+              return r;
+          }
+
+          #define SLOT(n) \
+              static uint64_t hk##n(uint64_t a, uint64_t b, uint64_t c, \
+                                    uint64_t d, uint64_t e, uint64_t f, \
+                                    uint64_t g, uint64_t h) { \
+                  return trace(n, a, b, c, d, e, f, g, h); \
+              }
+          #include "slots.inc"
+
+          // Service families to trace. "_bs" variants are skipped (wrappers).
+          static const char *PREFIX[] = {
+              "_h_nifm_", "_h_socket_", "_h_ssl_", "_h_nssl_", "_h_sk_",
+              "_h_nsk_", "_h_ldn_", "_h_fr_", "_h_acc_", "_h_aoc_", "_h_pctl_",
+              "_h_err_", "_h_ngc_", "_h_nsd_", "_h_prepo_", "_h_bt_",
+              "_h_nfp_", "_h_nfc_", "_h_sf_", "_h_ro_", "_h_ec_", "_h_oe_",
+              "_h_diag_", "_h_web_", "_h_album_", "_h_bcat_", "_h_set_",
+              "_h_stpl_", "_h_irs_", "_h_mii_", NULL
+          };
+          static const char *EXACT[] = {
+              "_unimpl_c", "_nvn_unimpl_c", NULL
+          };
+
+          static int wanted(const char *nm) {
+              size_t L = strlen(nm);
+              if (strchr(nm, '.') || strchr(nm, '$')) return 0;
+              for (int i = 0; EXACT[i]; i++)
+                  if (strcmp(nm, EXACT[i]) == 0) return 1;
+              if (L > 3 && strcmp(nm + L - 3, "_bs") == 0) return 0;
+              for (int i = 0; PREFIX[i]; i++)
+                  if (strncmp(nm, PREFIX[i], strlen(PREFIX[i])) == 0) return 1;
+              return 0;
+          }
+
+          typedef struct { uint64_t addr; const char *name; } Sym;
+          static int cmp(const void *a, const void *b) {
+              uint64_t x = ((const Sym *)a)->addr, y = ((const Sym *)b)->addr;
+              return x < y ? -1 : (x > y);
+          }
+
+          static MSHook_t find_hook(void) {
+              void *p = dlsym(RTLD_DEFAULT, "MSHookFunction");
+              if (p) return (MSHook_t)p;
+              uint32_t n = _dyld_image_count();
+              for (uint32_t i = 0; i < n; i++) {
+                  const char *nm = _dyld_get_image_name(i);
+                  if (nm && strstr(nm, "CydiaSubstrate")) {
+                      void *h = dlopen(nm, RTLD_NOLOAD | RTLD_NOW);
+                      if (h && (p = dlsym(h, "MSHookFunction"))) return (MSHook_t)p;
+                  }
+              }
+              return NULL;
+          }
 
           __attribute__((constructor))
-          static void symdump_main(void) {
+          static void trace_init(void) {
               char path[1024];
               const char *home = getenv("HOME");
-              snprintf(path, sizeof path, "%s/Documents/tweak_symbols.txt",
+              snprintf(path, sizeof path, "%s/Documents/tweak_trace.txt",
                        home ? home : "/tmp");
-              FILE *f = fopen(path, "w");
-              if (!f) return;
+              g_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+              if (g_fd < 0) return;
+
+              MSHook_t hook = find_hook();
+              if (!hook) { logf_("# MSHookFunction not found; no hooks\n"); return; }
 
               uint32_t count = _dyld_image_count();
-              int matched = 0;
-
               for (uint32_t i = 0; i < count; i++) {
                   const char *name = _dyld_get_image_name(i);
-                  if (!name || !strstr(name, ".app/")) continue;
+                  if (!name || !strstr(name, ".app/DmIOS")) continue;
 
                   const struct mach_header_64 *mh =
                       (const struct mach_header_64 *)_dyld_get_image_header(i);
                   if (!mh || mh->magic != MH_MAGIC_64) continue;
-
                   intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
                   const struct symtab_command *st = NULL;
-                  const struct segment_command_64 *linkedit = NULL;
-
-                  const struct load_command *lc =
-                      (const struct load_command *)(mh + 1);
+                  const struct segment_command_64 *le = NULL;
+                  const struct load_command *lc = (const void *)(mh + 1);
                   for (uint32_t c = 0; c < mh->ncmds; c++) {
-                      if (lc->cmd == LC_SYMTAB) {
-                          st = (const struct symtab_command *)lc;
-                      } else if (lc->cmd == LC_SEGMENT_64) {
-                          const struct segment_command_64 *seg =
-                              (const struct segment_command_64 *)lc;
-                          if (strcmp(seg->segname, "__LINKEDIT") == 0)
-                              linkedit = seg;
+                      if (lc->cmd == LC_SYMTAB) st = (const void *)lc;
+                      else if (lc->cmd == LC_SEGMENT_64) {
+                          const struct segment_command_64 *sg = (const void *)lc;
+                          if (strcmp(sg->segname, "__LINKEDIT") == 0) le = sg;
                       }
-                      lc = (const struct load_command *)
-                          ((const char *)lc + lc->cmdsize);
+                      lc = (const void *)((const char *)lc + lc->cmdsize);
                   }
-                  if (!st || !linkedit) continue;
+                  if (!st || !le) continue;
 
-                  matched++;
-                  uintptr_t base = (uintptr_t)(linkedit->vmaddr + slide
-                                               - linkedit->fileoff);
-                  const struct nlist_64 *syms =
-                      (const struct nlist_64 *)(base + st->symoff);
+                  uintptr_t base = (uintptr_t)(le->vmaddr + slide - le->fileoff);
+                  const struct nlist_64 *syms = (const void *)(base + st->symoff);
                   const char *strs = (const char *)(base + st->stroff);
 
-                  fprintf(f, "# image %s slide=0x%lx nsyms=%u\n",
-                          name, (long)slide, st->nsyms);
+                  Sym *all = malloc(sizeof(Sym) * st->nsyms);
+                  uint32_t na = 0;
                   for (uint32_t s = 0; s < st->nsyms; s++) {
                       if (syms[s].n_type & N_STAB) continue;
+                      if ((syms[s].n_type & N_TYPE) != N_SECT) continue;
                       if (syms[s].n_value == 0) continue;
-                      fprintf(f, "%llx %s\n",
-                              (unsigned long long)syms[s].n_value,
-                              strs + syms[s].n_un.n_strx);
+                      all[na].addr = syms[s].n_value;
+                      all[na].name = strs + syms[s].n_un.n_strx;
+                      na++;
                   }
-              }
+                  qsort(all, na, sizeof(Sym), cmp);
 
-              if (!matched) {
-                  fprintf(f, "# no app images matched; all images:\n");
-                  for (uint32_t i = 0; i < count; i++)
-                      fprintf(f, "# %s\n", _dyld_get_image_name(i));
+                  logf_("# image %s slide=0x%lx symbols=%u\n", name, (long)slide, na);
+                  int k = 0, small = 0;
+                  for (uint32_t s = 0; s < na && k < MAXSLOTS; s++) {
+                      if (s > 0 && all[s].addr == all[s - 1].addr) continue;
+                      if (!wanted(all[s].name)) continue;
+                      uint32_t t = s + 1;
+                      while (t < na && all[t].addr == all[s].addr) t++;
+                      uint64_t size = (t < na) ? all[t].addr - all[s].addr : 0;
+                      if (size < 16) { small++; continue; }
+
+                      NAME[k] = all[s].name;
+                      void *target = (void *)(uintptr_t)(all[s].addr + slide);
+                      hook(target, HK[k], (void **)&ORIG[k]);
+                      if (ORIG[k]) { logf_("# hooked %s\n", all[s].name); k++; }
+                  }
+                  logf_("# hooks installed: %d (skipped tiny: %d)\n", k, small);
+                  free(all);
+                  break;
               }
-              fclose(f);
           }
           EOF
 
@@ -102,16 +238,16 @@ jobs:
           xcrun -sdk iphoneos clang \
             -arch arm64 -dynamiclib -O1 \
             -miphoneos-version-min=15.0 \
-            -install_name @rpath/SymDump.dylib \
-            -o SymDump.dylib tweak/symdump.c
-          codesign -f -s - SymDump.dylib
-          file SymDump.dylib
-          ls -lh SymDump.dylib
+            -install_name @rpath/Trace.dylib \
+            -o Trace.dylib tweak/trace.c -Itweak
+          codesign -f -s - Trace.dylib
+          file Trace.dylib
+          ls -lh Trace.dylib
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: SymDump-dylib
-          path: SymDump.dylib
+          name: Trace-dylib
+          path: Trace.dylib
           if-no-files-found: error
           retention-days: 7
