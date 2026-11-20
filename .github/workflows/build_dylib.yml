@@ -24,7 +24,6 @@ jobs:
           #include <mach-o/dyld.h>
           #include <sys/ucontext.h>
 
-          static struct sigaction old_sigsegv;
           static char g_log_path[1024] = {0};
           static uint64_t g_dummy_buffer[512];
 
@@ -43,30 +42,13 @@ jobs:
               _STRUCT_ARM_THREAD_STATE64 *ts = &uc->uc_mcontext->__ss;
 
               uintptr_t pc = arm_thread_state64_get_pc(*ts);
-              uintptr_t fault_addr = (uintptr_t)info->si_addr;
+              write_diag_log("[NX_PATCH] Caught SIGSEGV. Forcing registers to dummy buffer and advancing PC...\n");
+              
+              ts->__x[20] = (uint64_t)g_dummy_buffer;
+              ts->__x[8]  = (uint64_t)g_dummy_buffer;
+              ts->__x[0]  = (uint64_t)g_dummy_buffer;
 
-              if (ts->__x[20] == 0 || fault_addr < 0x1000) {
-                  write_diag_log("[NX_PATCH] Caught null/low pointer dereference! Supplying self-referential buffer...\n");
-                  ts->__x[20] = (uint64_t)g_dummy_buffer;
-                  if (ts->__x[8] < 0x1000) {
-                      ts->__x[8] = (uint64_t)g_dummy_buffer;
-                  }
-                  return;
-              }
-
-              char buf[512];
-              snprintf(buf, sizeof(buf), "\n=== UNHANDLED SIGSEGV ===\nfa=0x%lx pc=0x%lx x20=0x%llx x8=0x%llx\n",
-                       fault_addr, pc, ts->__x[20], ts->__x[8]);
-              write_diag_log(buf);
-
-              if (old_sigsegv.sa_flags & SA_SIGINFO) {
-                  old_sigsegv.sa_sigaction(sig, info, uap);
-              } else if (old_sigsegv.sa_handler != SIG_DFL && old_sigsegv.sa_handler != SIG_IGN) {
-                  old_sigsegv.sa_handler(sig);
-              } else {
-                  signal(SIGSEGV, SIG_DFL);
-                  raise(SIGSEGV);
-              }
+              arm_thread_state64_set_pc_nsp(*ts, pc + 4, ts->__sp);
           }
 
           __attribute__((constructor))
@@ -82,7 +64,7 @@ jobs:
                   strncpy(g_log_path, fullPath.UTF8String, sizeof(g_log_path) - 1);
               }
 
-              write_diag_log("=== nx_patch loaded (self-referential) ===\n");
+              write_diag_log("=== nx_patch active advance loaded ===\n");
 
               struct sigaction sa;
               memset(&sa, 0, sizeof(sa));
@@ -91,8 +73,8 @@ jobs:
               sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                  sigaction(SIGSEGV, &sa, &old_sigsegv);
-                  write_diag_log("SIGSEGV self-referential patch handler installed.\n");
+                  sigaction(SIGSEGV, &sa, NULL);
+                  write_diag_log("Active advance SIGSEGV handler installed.\n");
               });
           }
           EOF
