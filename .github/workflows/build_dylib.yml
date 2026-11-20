@@ -17,10 +17,11 @@ jobs:
           #include <stdint.h>
           #include <stdlib.h>
           #include <unistd.h>
-          #include <ucontext.h>
+          #include <sys/ucontext.h>
+          #include <mach/mach.h>
 
           static void handler(int sig, siginfo_t *si, void *uc_) {
-              ucontext_t *uc = uc_;
+              ucontext_t *uc = (ucontext_t *)uc_;
               uint64_t pc = uc->uc_mcontext->__ss.__pc;
               uint64_t lr = uc->uc_mcontext->__ss.__lr;
               uint64_t x20 = uc->uc_mcontext->__ss.__x[20];
