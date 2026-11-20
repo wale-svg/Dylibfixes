@@ -1,119 +1,153 @@
-
-name: Build Splatoon2Compatibility
+name: Build nx_diag.dylib
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Generate Objective-C source
+      - name: Create Source File
+      run: |
+        cat << 'EOF' > diag.m
+        #import <Foundation/Foundation.h>
+        #include <signal.h>
+        #include <stdio.h>
+        #include <stdint.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <mach/mach.h>
+        #include <mach-o/dyld.h>
+        #include <sys/ucontext.h>
+
+        static struct sigaction old_sigsegv;
+        static char g_log_path[1024] = {0};
+
+        static void write_diag_log(const char *msg) {
+            if (g_log_path[0] == '\0') return;
+            FILE *f = fopen(g_log_path, "a");
+            if (f) {
+                fputs(msg, f);
+                fflush(f);
+                fclose(f);
+            }
+        }
+
+        static bool safe_read_uint32(uintptr_t addr, uint32_t *out) {
+            vm_size_t size = sizeof(uint32_t);
+            vm_offset_t data = 0;
+            mach_msg_type_number_t count = 0;
+            kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)addr, size, &data, &count);
+            if (kr == KERN_SUCCESS && count >= sizeof(uint32_t)) {
+                *out = *(uint32_t *)data;
+                vm_deallocate(mach_task_self(), data, count);
+                return true;
+            }
+            return false;
+        }
+
+        static void segv_handler(int sig, siginfo_t *info, void *uap) {
+            ucontext_t *uc = (ucontext_t *)uap;
+            _STRUCT_ARM_THREAD_STATE64 *ts = &uc->uc_mcontext->__ss;
+
+            uintptr_t pc = arm_thread_state64_get_pc(*ts);
+            uintptr_t lr = arm_thread_state64_get_lr(*ts);
+            uintptr_t sp = arm_thread_state64_get_sp(*ts);
+            uintptr_t fp = arm_thread_state64_get_fp(*ts);
+            uintptr_t fault_addr = (uintptr_t)info->si_addr;
+
+            char buf[4096];
+            int off = 0;
+
+            off += snprintf(buf + off, sizeof(buf) - off,
+                "\n=== NX_DIAG SIGSEGV INTERCEPTED ===\n"
+                "fault_addr = 0x%lx\n"
+                "pc         = 0x%lx\n"
+                "lr         = 0x%lx\n"
+                "sp         = 0x%lx\n"
+                "fp         = 0x%lx\n",
+                fault_addr, pc, lr, sp, fp);
+
+            for (int i = 0; i < 29; i++) {
+                off += snprintf(buf + off, sizeof(buf) - off, "x%-2d = 0x%016llx%s",
+                                i, ts->__x[i], (i % 2 == 1) ? "\n" : "  ");
+            }
+            off += snprintf(buf + off, sizeof(buf) - off, "\n\n--- Instruction Window around PC ---\n");
+
+            for (int delta = -32; delta <= 32; delta += 4) {
+                uintptr_t inst_addr = pc + delta;
+                uint32_t word = 0;
+                if (safe_read_uint32(inst_addr, &word)) {
+                    off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (pc%+d): 0x%08x\n",
+                                    (delta == 0) ? ">>>" : "   ", inst_addr, delta, word);
+                } else {
+                    off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (pc%+d): <unreadable>\n",
+                                    (delta == 0) ? ">>>" : "   ", inst_addr, delta);
+                }
+            }
+
+            off += snprintf(buf + off, sizeof(buf) - off, "\n--- Instruction Window around LR ---\n");
+            for (int delta = -24; delta <= 16; delta += 4) {
+                uintptr_t inst_addr = lr + delta;
+                uint32_t word = 0;
+                if (safe_read_uint32(inst_addr, &word)) {
+                    off += snprintf(buf + off, sizeof(buf) - off, "%s 0x%lx (lr%+d): 0x%08x\n",
+                                    (delta == 0) ? ">>>" : "   ", inst_addr, delta, word);
+                }
+            }
+
+            write_diag_log(buf);
+
+            if (old_sigsegv.sa_flags & SA_SIGINFO) {
+                old_sigsegv.sa_sigaction(sig, info, uap);
+            } else if (old_sigsegv.sa_handler != SIG_DFL && old_sigsegv.sa_handler != SIG_IGN) {
+                old_sigsegv.sa_handler(sig);
+            } else {
+                signal(SIGSEGV, SIG_DFL);
+                raise(SIGSEGV);
+            }
+        }
+
+        __attribute__((constructor))
+        static void init_diag(void) {
+            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+            if (paths.count > 0) {
+                NSString *docDir = paths.firstObject;
+                NSString *fullPath = [docDir stringByAppendingPathComponent:@"diag_dump.txt"];
+                strncpy(g_log_path, fullPath.UTF8String, sizeof(g_log_path) - 1);
+            }
+
+            write_diag_log("=== nx_diag loaded ===\n");
+
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = segv_handler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                sigaction(SIGSEGV, &sa, &old_sigsegv);
+                write_diag_log("SIGSEGV wrapper installed.\n");
+            });
+        }
+        EOF
+
+      - name: Compile Dylib
         run: |
-          mkdir -p Source build
+          xcrun --sdk iphoneos clang -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -shared -fobjc-arc -framework Foundation \
+            diag.m -o nx_diag.dylib
+          
+          # Optional: ad-hoc sign so iOS container loader accepts it without crashing on load
+          codesign -s - nx_diag.dylib
 
-          cat > Source/Compatibility.m <<'OBJC'
-          #import <Foundation/Foundation.h>
-
-          static void WriteDiagnostic(NSString *message) {
-              @autoreleasepool {
-                  NSFileManager *manager = [NSFileManager defaultManager];
-
-                  NSArray<NSURL *> *documents =
-                      [manager URLsForDirectory:NSDocumentDirectory
-                                      inDomains:NSUserDomainMask];
-
-                  if (documents.count == 0) {
-                      NSLog(@"[S2Compat] Documents directory unavailable");
-                      return;
-                  }
-
-                  NSURL *directory = [documents.firstObject
-                      URLByAppendingPathComponent:@"S2Compat"
-                                      isDirectory:YES];
-
-                  NSError *error = nil;
-
-                  [manager createDirectoryAtURL:directory
-                    withIntermediateDirectories:YES
-                                     attributes:nil
-                                          error:&error];
-
-                  if (error) {
-                      NSLog(@"[S2Compat] Directory error: %@", error);
-                      return;
-                  }
-
-                  NSURL *file = [directory
-                      URLByAppendingPathComponent:@"diagnostics.txt"];
-
-                  if (![manager fileExistsAtPath:file.path]) {
-                      [manager createFileAtPath:file.path
-                                       contents:nil
-                                     attributes:nil];
-                  }
-
-                  NSFileHandle *handle =
-                      [NSFileHandle fileHandleForWritingAtPath:file.path];
-
-                  if (!handle) {
-                      NSLog(@"[S2Compat] Could not open diagnostics file");
-                      return;
-                  }
-
-                  NSString *entry = [NSString stringWithFormat:
-                      @"[%@] %@\n", [NSDate date], message];
-
-                  NSData *data =
-                      [entry dataUsingEncoding:NSUTF8StringEncoding];
-
-                  @try {
-                      [handle seekToEndOfFile];
-                      [handle writeData:data];
-                      [handle closeFile];
-                  } @catch (NSException *exception) {
-                      NSLog(@"[S2Compat] Write error: %@", exception);
-                  }
-              }
-          }
-
-          __attribute__((constructor))
-          static void CompatibilityInitialize(void) {
-              @autoreleasepool {
-                  WriteDiagnostic(@"S2Compat loaded successfully");
-                  WriteDiagnostic(@"Architecture: ARM64");
-                  WriteDiagnostic(@"Diagnostic mode enabled");
-                  WriteDiagnostic(@"Initialization complete");
-              }
-          }
-          OBJC
-
-      - name: Build ARM64 dylib
-        run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-
-          xcrun --sdk iphoneos clang \
-            -dynamiclib \
-            -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=15.0 \
-            -framework Foundation \
-            Source/Compatibility.m \
-            -o build/Splatoon2Compatibility.dylib
-
-      - name: Verify build
-        run: |
-          file build/Splatoon2Compatibility.dylib
-          ls -lh build/Splatoon2Compatibility.dylib
-
-      - name: Upload dylib
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Splatoon2Compatibility
-          path: build/Splatoon2Compatibility.dylib
+          name: nx_diag-dylib
+          path: nx_diag.dylib
