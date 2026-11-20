@@ -41,14 +41,15 @@ jobs:
               ucontext_t *uc = (ucontext_t *)uap;
               _STRUCT_ARM_THREAD_STATE64 *ts = &uc->uc_mcontext->__ss;
 
-              uintptr_t pc = arm_thread_state64_get_pc(*ts);
+              uintptr_t pc = ts->__pc;
               write_diag_log("[NX_PATCH] Caught SIGSEGV. Forcing registers to dummy buffer and advancing PC...\n");
               
               ts->__x[20] = (uint64_t)g_dummy_buffer;
               ts->__x[8]  = (uint64_t)g_dummy_buffer;
               ts->__x[0]  = (uint64_t)g_dummy_buffer;
 
-              arm_thread_state64_set_pc_nsp(*ts, pc + 4, ts->__sp);
+              // Directly advance program counter past the faulting instruction
+              ts->__pc = pc + 4;
           }
 
           __attribute__((constructor))
