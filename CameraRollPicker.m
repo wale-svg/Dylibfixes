@@ -1,10 +1,10 @@
 // ============================================================
 // CameraRollPicker.m
-// Floating green button on left safe-area edge (portrait + landscape).
+// Floating green camera-roll button attached to the app's key
+// window root view (no overlay window, no touch interference).
 // Tap -> PHPickerViewController (images + videos).
-// Overlay window passes through touches so the host app stays fully
-// interactive. Selected media is delivered via delegate forwarding
-// and NSNotification.
+// Selected media is delivered via delegate forwarding and
+// NSNotification.
 // Compile: clang -arch arm64 -arch arm64e -shared -o CameraRollPicker.dylib \
 //   CameraRollPicker.m -framework Foundation -framework UIKit \
 //   -framework PhotosUI -framework AVFoundation -fobjc-arc
@@ -21,7 +21,6 @@ static UIImagePickerController *gActiveImagePicker = nil;
 static id gActiveImagePickerDelegate = nil;
 static AVCapturePhotoOutput *gActivePhotoOutput = nil;
 static UIButton *gFloatingButton = nil;
-static UIWindow *gOverlayWindow = nil;
 static id gActivePickerDelegate = nil;
 
 // ============================================================
@@ -91,53 +90,27 @@ static void deliverImage(UIImage *image) {
 @end
 
 // ============================================================
-// 4. Passthrough container view – only the button receives touches
-// ============================================================
-@interface PassthroughView : UIView
-@property (nonatomic, weak) UIView *interactiveSubview;
-@end
-
-@implementation PassthroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.interactiveSubview) {
-        CGPoint p = [self.interactiveSubview convertPoint:point fromView:self];
-        if ([self.interactiveSubview pointInside:p withEvent:event]) {
-            return [self.interactiveSubview hitTest:p withEvent:event];
-        }
-    }
-    return nil; // touches fall through to the app window
-}
-@end
-
-// ============================================================
-// 5. Floating green button with Auto Layout (orientation-safe)
-//    Installed in a passthrough overlay window that never becomes key.
+// 4. Floating green button attached to the app's key window root
+//    view. No overlay UIWindow is created, so the host app keeps
+//    receiving all touches normally.
 // ============================================================
 static void installFloatingButton(void) {
     if (gFloatingButton) return;
-    UIWindowScene *scene = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+
+    // Find the app's current key window (do NOT create a new one)
+    UIWindow *hostWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (w.isKeyWindow) { hostWindow = w; break; }
+        }
+        if (hostWindow) break;
     }
-    if (!scene) return;
+    if (!hostWindow) hostWindow = [UIApplication sharedApplication].keyWindow;
+    if (!hostWindow) return;
 
-    UIWindow *previousKey = nil;
-    for (UIWindow *w in scene.windows) {
-        if (w.isKeyWindow) { previousKey = w; break; }
-    }
-
-    gOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 10;
-    gOverlayWindow.backgroundColor = [UIColor clearColor];
-    gOverlayWindow.rootViewController = [[UIViewController alloc] init];
-
-    PassthroughView *container = [[PassthroughView alloc] initWithFrame:gOverlayWindow.bounds];
-    container.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    container.backgroundColor = [UIColor clearColor];
-    gOverlayWindow.rootViewController.view = container;
-
-    gOverlayWindow.hidden = NO;
-    if (previousKey) [previousKey makeKeyWindow];
+    UIView *hostView = hostWindow.rootViewController.view;
+    if (!hostView) return;
 
     CGFloat size = 56.0;
     gFloatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -160,10 +133,9 @@ static void installFloatingButton(void) {
     }];
     [gFloatingButton addAction:action forControlEvents:UIControlEventTouchUpInside];
 
-    [container addSubview:gFloatingButton];
-    container.interactiveSubview = gFloatingButton;
+    [hostView addSubview:gFloatingButton];
 
-    UILayoutGuide *safe = container.safeAreaLayoutGuide;
+    UILayoutGuide *safe = hostView.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [gFloatingButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
         [gFloatingButton.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
@@ -171,11 +143,11 @@ static void installFloatingButton(void) {
         [gFloatingButton.heightAnchor constraintEqualToConstant:size]
     ]];
 
-    NSLog(@"[CameraRollPicker] Floating button installed – passthrough window, app remains interactive.");
+    NSLog(@"[CameraRollPicker] Button attached to host window – no overlay window.");
 }
 
 // ============================================================
-// 6. Hook UIImagePickerController presentation
+// 5. Hook UIImagePickerController presentation
 // ============================================================
 @interface UIViewController (CameraRollHook)
 @end
@@ -202,7 +174,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 7. Capture AVCapturePhotoOutput instances
+// 6. Capture AVCapturePhotoOutput instances
 // ============================================================
 @interface AVCapturePhotoOutput (CameraRollHook)
 @end
@@ -224,7 +196,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 8. Install button on app launch
+// 7. Install button on app launch
 // ============================================================
 __attribute__((constructor)) static void initCameraRollPicker(void) {
     NSLog(@"[CameraRollPicker] Loaded.");
