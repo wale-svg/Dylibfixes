@@ -1,9 +1,12 @@
 // ============================================================
 // CameraRollPicker.m
-// Floating green camera-roll button attached to the app's key
-// window root view (no overlay window, no touch interference).
+// Floating green camera-roll button that follows the top-most
+// view controller, so it stays visible above ANY page that covers
+// the app (web views, pushed controllers, modals, tab switches,
+// etc.). No overlay UIWindow is created, so host app touches
+// remain fully functional.
 // Tap -> PHPickerViewController (images + videos).
-// Selected media is delivered via delegate forwarding and
+// Selected media delivered via delegate forwarding and
 // NSNotification.
 // Compile: clang -arch arm64 -arch arm64e -shared -o CameraRollPicker.dylib \
 //   CameraRollPicker.m -framework Foundation -framework UIKit \
@@ -24,7 +27,7 @@ static UIButton *gFloatingButton = nil;
 static id gActivePickerDelegate = nil;
 
 // ============================================================
-// 1. Top-most view controller
+// 1. Top-most view controller (walks entire presented chain)
 // ============================================================
 static UIViewController *topViewController(void) {
     UIWindow *keyWindow = nil;
@@ -90,27 +93,47 @@ static void deliverImage(UIImage *image) {
 @end
 
 // ============================================================
-// 4. Floating green button attached to the app's key window root
-//    view. No overlay UIWindow is created, so the host app keeps
-//    receiving all touches normally.
+// 4. Re-attach button to the current top-most view
+// ============================================================
+static void installFloatingButton(void); // forward decl
+
+static void reattachFloatingButton(void) {
+    if (!gFloatingButton) { installFloatingButton(); return; }
+    UIViewController *top = topViewController();
+    if (!top || !top.view) return;
+    UIView *targetView = top.view;
+    if (gFloatingButton.superview == targetView) return;
+
+    [gFloatingButton removeFromSuperview];
+
+    // Remove constraints referencing the button from the old superview
+    UIView *oldSuper = gFloatingButton.superview;
+    if (oldSuper) {
+        for (NSLayoutConstraint *c in [oldSuper.constraints copy]) {
+            if (c.firstItem == gFloatingButton || c.secondItem == gFloatingButton) {
+                [oldSuper removeConstraint:c];
+            }
+        }
+    }
+
+    [targetView addSubview:gFloatingButton];
+    [targetView bringSubviewToFront:gFloatingButton];
+
+    CGFloat size = 56.0;
+    UILayoutGuide *safe = targetView.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [gFloatingButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
+        [gFloatingButton.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
+        [gFloatingButton.widthAnchor constraintEqualToConstant:size],
+        [gFloatingButton.heightAnchor constraintEqualToConstant:size]
+    ]];
+}
+
+// ============================================================
+// 5. Install the button (created once, then attached to top view)
 // ============================================================
 static void installFloatingButton(void) {
-    if (gFloatingButton) return;
-
-    // Find the app's current key window (do NOT create a new one)
-    UIWindow *hostWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            if (w.isKeyWindow) { hostWindow = w; break; }
-        }
-        if (hostWindow) break;
-    }
-    if (!hostWindow) hostWindow = [UIApplication sharedApplication].keyWindow;
-    if (!hostWindow) return;
-
-    UIView *hostView = hostWindow.rootViewController.view;
-    if (!hostView) return;
+    if (gFloatingButton) { reattachFloatingButton(); return; }
 
     CGFloat size = 56.0;
     gFloatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -133,21 +156,11 @@ static void installFloatingButton(void) {
     }];
     [gFloatingButton addAction:action forControlEvents:UIControlEventTouchUpInside];
 
-    [hostView addSubview:gFloatingButton];
-
-    UILayoutGuide *safe = hostView.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [gFloatingButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
-        [gFloatingButton.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
-        [gFloatingButton.widthAnchor constraintEqualToConstant:size],
-        [gFloatingButton.heightAnchor constraintEqualToConstant:size]
-    ]];
-
-    NSLog(@"[CameraRollPicker] Button attached to host window – no overlay window.");
+    reattachFloatingButton();
 }
 
 // ============================================================
-// 5. Hook UIImagePickerController presentation
+// 6. Hook UIImagePickerController presentation
 // ============================================================
 @interface UIViewController (CameraRollHook)
 @end
@@ -174,7 +187,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 6. Capture AVCapturePhotoOutput instances
+// 7. Capture AVCapturePhotoOutput instances
 // ============================================================
 @interface AVCapturePhotoOutput (CameraRollHook)
 @end
@@ -196,7 +209,53 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 7. Install button on app launch
+// 8. Keep button on top across ALL page transitions
+//    (web views, pushed controllers, modals, tab switches, etc.)
+// ============================================================
+@interface UIViewController (FloatingButtonFollow)
+@end
+@implementation UIViewController (FloatingButtonFollow)
+
++ (void)load {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = [UIViewController class];
+
+        Method m1 = class_getInstanceMethod(cls, @selector(viewDidAppear:));
+        Method m2 = class_getInstanceMethod(cls, @selector(swz_viewDidAppear:));
+        method_exchangeImplementations(m1, m2);
+
+        Method m3 = class_getInstanceMethod(cls, @selector(viewDidLayoutSubviews));
+        Method m4 = class_getInstanceMethod(cls, @selector(swz_viewDidLayoutSubviews));
+        method_exchangeImplementations(m3, m4);
+
+        Method m5 = class_getInstanceMethod(cls, @selector(dismissViewControllerAnimated:completion:));
+        Method m6 = class_getInstanceMethod(cls, @selector(swz_dismissViewControllerAnimated:completion:));
+        method_exchangeImplementations(m5, m6);
+    });
+}
+
+- (void)swz_viewDidAppear:(BOOL)animated {
+    [self swz_viewDidAppear:animated];
+    dispatch_async(dispatch_get_main_queue(), ^{ reattachFloatingButton(); });
+}
+
+- (void)swz_viewDidLayoutSubviews {
+    [self swz_viewDidLayoutSubviews];
+    dispatch_async(dispatch_get_main_queue(), ^{ reattachFloatingButton(); });
+}
+
+- (void)swz_dismissViewControllerAnimated:(BOOL)flag completion:(void (^)(void))completion {
+    [self swz_dismissViewControllerAnimated:flag completion:^{
+        if (completion) completion();
+        dispatch_async(dispatch_get_main_queue(), ^{ reattachFloatingButton(); });
+    }];
+}
+
+@end
+
+// ============================================================
+// 9. Install button on app launch
 // ============================================================
 __attribute__((constructor)) static void initCameraRollPicker(void) {
     NSLog(@"[CameraRollPicker] Loaded.");
