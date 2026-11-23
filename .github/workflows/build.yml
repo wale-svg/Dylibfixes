@@ -20,11 +20,11 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Verify toolchain and source
+      # 2. Verify toolchain and source (no sudo, no xcode-select)
       - name: Verify toolchain and source
         run: |
-          xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
           clang --version
           ls -la CameraRollPicker.m
           test -f CameraRollPicker.m || (echo "Missing CameraRollPicker.m" && exit 1)
@@ -67,7 +67,7 @@ jobs:
           lipo -info CameraRollPicker.dylib
           file CameraRollPicker.dylib
 
-      # 6. Ad-hoc codesign (optional but recommended)
+      # 6. Ad-hoc codesign
       - name: Ad-hoc codesign
         run: |
           codesign --force --sign - CameraRollPicker.dylib || echo "codesign skipped"
