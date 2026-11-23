@@ -1,0 +1,89 @@
+# ============================================================
+# .github/workflows/build.yml
+# Builds CameraRollPicker.dylib on GitHub Actions (macos-14)
+# and produces a downloadable artifact.
+# ============================================================
+
+name: Build CameraRollPicker dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # 2. Select Xcode (macos-14 ships with Xcode 15.x)
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          clang --version
+
+      # 3. Verify source file exists
+      - name: Verify source
+        run: |
+          ls -la CameraRollPicker.m
+          test -f CameraRollPicker.m || (echo "Missing CameraRollPicker.m" && exit 1)
+
+      # 4. Compile arm64 slice
+      - name: Compile arm64
+        run: |
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+            -isysroot "$SDKROOT" \
+            -miphoneos-version-min=14.0 \
+            -shared -o CameraRollPicker_arm64.dylib \
+            CameraRollPicker.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework PhotosUI \
+            -fobjc-arc
+
+      # 5. Compile arm64e slice
+      - name: Compile arm64e
+        run: |
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64e \
+            -isysroot "$SDKROOT" \
+            -miphoneos-version-min=14.0 \
+            -shared -o CameraRollPicker_arm64e.dylib \
+            CameraRollPicker.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework PhotosUI \
+            -fobjc-arc
+
+      # 6. Merge into universal (fat) dylib
+      - name: Create universal dylib
+        run: |
+          lipo -create \
+            CameraRollPicker_arm64.dylib \
+            CameraRollPicker_arm64e.dylib \
+            -output CameraRollPicker.dylib
+          lipo -info CameraRollPicker.dylib
+          file CameraRollPicker.dylib
+
+      # 7. Ad-hoc codesign (optional but recommended)
+      - name: Ad-hoc codesign
+        run: |
+          codesign --force --sign - CameraRollPicker.dylib || echo "codesign skipped"
+          codesign -dv CameraRollPicker.dylib 2>&1 || true
+
+      # 8. Upload artifact
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraRollPicker-dylib
+          path: |
+            CameraRollPicker.dylib
+            CameraRollPicker_arm64.dylib
+            CameraRollPicker_arm64e.dylib
+          retention-days: 30
