@@ -20,7 +20,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Verify toolchain and source (no sudo, no xcode-select)
+      # 2. Verify toolchain and source
       - name: Verify toolchain and source
         run: |
           xcodebuild -version
@@ -41,6 +41,7 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework PhotosUI \
+            -framework AVFoundation \
             -fobjc-arc
 
       # 4. Compile arm64e slice
@@ -55,6 +56,7 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework PhotosUI \
+            -framework AVFoundation \
             -fobjc-arc
 
       # 5. Merge into universal (fat) dylib
