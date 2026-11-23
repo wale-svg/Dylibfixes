@@ -1,9 +1,10 @@
 // ============================================================
 // CameraRollPicker.m
-// Floating green button on left safe-area edge (works in portrait
-// and landscape). Tap -> PHPickerViewController (images + videos).
-// Selected media is delivered to the active camera consumer via
-// delegate forwarding and NSNotification.
+// Floating green button on left safe-area edge (portrait + landscape).
+// Tap -> PHPickerViewController (images + videos).
+// Overlay window passes through touches so the host app stays fully
+// interactive. Selected media is delivered via delegate forwarding
+// and NSNotification.
 // Compile: clang -arch arm64 -arch arm64e -shared -o CameraRollPicker.dylib \
 //   CameraRollPicker.m -framework Foundation -framework UIKit \
 //   -framework PhotosUI -framework AVFoundation -fobjc-arc
@@ -90,7 +91,27 @@ static void deliverImage(UIImage *image) {
 @end
 
 // ============================================================
-// 4. Floating green button with Auto Layout (orientation-safe)
+// 4. Passthrough container view – only the button receives touches
+// ============================================================
+@interface PassthroughView : UIView
+@property (nonatomic, weak) UIView *interactiveSubview;
+@end
+
+@implementation PassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.interactiveSubview) {
+        CGPoint p = [self.interactiveSubview convertPoint:point fromView:self];
+        if ([self.interactiveSubview pointInside:p withEvent:event]) {
+            return [self.interactiveSubview hitTest:p withEvent:event];
+        }
+    }
+    return nil; // touches fall through to the app window
+}
+@end
+
+// ============================================================
+// 5. Floating green button with Auto Layout (orientation-safe)
+//    Installed in a passthrough overlay window that never becomes key.
 // ============================================================
 static void installFloatingButton(void) {
     if (gFloatingButton) return;
@@ -100,12 +121,23 @@ static void installFloatingButton(void) {
     }
     if (!scene) return;
 
+    UIWindow *previousKey = nil;
+    for (UIWindow *w in scene.windows) {
+        if (w.isKeyWindow) { previousKey = w; break; }
+    }
+
     gOverlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
     gOverlayWindow.windowLevel = UIWindowLevelAlert + 10;
     gOverlayWindow.backgroundColor = [UIColor clearColor];
     gOverlayWindow.rootViewController = [[UIViewController alloc] init];
-    gOverlayWindow.rootViewController.view.backgroundColor = [UIColor clearColor];
-    [gOverlayWindow makeKeyAndVisible];
+
+    PassthroughView *container = [[PassthroughView alloc] initWithFrame:gOverlayWindow.bounds];
+    container.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    container.backgroundColor = [UIColor clearColor];
+    gOverlayWindow.rootViewController.view = container;
+
+    gOverlayWindow.hidden = NO;
+    if (previousKey) [previousKey makeKeyWindow];
 
     CGFloat size = 56.0;
     gFloatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -128,10 +160,10 @@ static void installFloatingButton(void) {
     }];
     [gFloatingButton addAction:action forControlEvents:UIControlEventTouchUpInside];
 
-    UIView *rootView = gOverlayWindow.rootViewController.view;
-    [rootView addSubview:gFloatingButton];
+    [container addSubview:gFloatingButton];
+    container.interactiveSubview = gFloatingButton;
 
-    UILayoutGuide *safe = rootView.safeAreaLayoutGuide;
+    UILayoutGuide *safe = container.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
         [gFloatingButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
         [gFloatingButton.centerYAnchor constraintEqualToAnchor:safe.centerYAnchor],
@@ -139,11 +171,11 @@ static void installFloatingButton(void) {
         [gFloatingButton.heightAnchor constraintEqualToConstant:size]
     ]];
 
-    NSLog(@"[CameraRollPicker] Floating green button installed (orientation-safe).");
+    NSLog(@"[CameraRollPicker] Floating button installed – passthrough window, app remains interactive.");
 }
 
 // ============================================================
-// 5. Hook UIImagePickerController presentation
+// 6. Hook UIImagePickerController presentation
 // ============================================================
 @interface UIViewController (CameraRollHook)
 @end
@@ -170,7 +202,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 6. Capture AVCapturePhotoOutput instances
+// 7. Capture AVCapturePhotoOutput instances
 // ============================================================
 @interface AVCapturePhotoOutput (CameraRollHook)
 @end
@@ -192,7 +224,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 7. Install button on app launch
+// 8. Install button on app launch
 // ============================================================
 __attribute__((constructor)) static void initCameraRollPicker(void) {
     NSLog(@"[CameraRollPicker] Loaded.");
