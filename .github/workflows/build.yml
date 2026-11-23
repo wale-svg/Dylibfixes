@@ -1,6 +1,6 @@
 # ============================================================
 # .github/workflows/build.yml
-# Builds CameraRollPicker.dylib on GitHub Actions (macos-14)
+# Builds CameraRollPicker.dylib on GitHub Actions (macOS arm64)
 # and produces a downloadable artifact.
 # ============================================================
 
@@ -13,27 +13,23 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       # 1. Checkout repository
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Select Xcode (macos-14 ships with Xcode 15.x)
-      - name: Select Xcode
+      # 2. Verify toolchain and source
+      - name: Verify toolchain and source
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
           clang --version
-
-      # 3. Verify source file exists
-      - name: Verify source
-        run: |
           ls -la CameraRollPicker.m
           test -f CameraRollPicker.m || (echo "Missing CameraRollPicker.m" && exit 1)
 
-      # 4. Compile arm64 slice
+      # 3. Compile arm64 slice
       - name: Compile arm64
         run: |
           SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -47,7 +43,7 @@ jobs:
             -framework PhotosUI \
             -fobjc-arc
 
-      # 5. Compile arm64e slice
+      # 4. Compile arm64e slice
       - name: Compile arm64e
         run: |
           SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -61,7 +57,7 @@ jobs:
             -framework PhotosUI \
             -fobjc-arc
 
-      # 6. Merge into universal (fat) dylib
+      # 5. Merge into universal (fat) dylib
       - name: Create universal dylib
         run: |
           lipo -create \
@@ -71,13 +67,13 @@ jobs:
           lipo -info CameraRollPicker.dylib
           file CameraRollPicker.dylib
 
-      # 7. Ad-hoc codesign (optional but recommended)
+      # 6. Ad-hoc codesign (optional but recommended)
       - name: Ad-hoc codesign
         run: |
           codesign --force --sign - CameraRollPicker.dylib || echo "codesign skipped"
           codesign -dv CameraRollPicker.dylib 2>&1 || true
 
-      # 8. Upload artifact
+      # 7. Upload artifact
       - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
