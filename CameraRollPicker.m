@@ -1,18 +1,10 @@
 // ============================================================
 // CameraRollPicker.m
-// Universal camera-input replacement.
-// Detects ALL camera input paths used by iOS apps:
-//   1) UIImagePickerController (camera source)
-//   2) WKWebView <input type="file" capture>
-//   3) Custom AVCaptureSession / AVCapturePhotoOutput
-//   4) UIDocumentPickerViewController (camera-roll import)
-//   5) PHPickerViewController (existing photo library flow)
-// Floating green button on left safe-area edge, follows every
-// page transition. Picked image/video is pushed into whichever
-// path the host app is using at the moment of capture.
-// Compile: clang -arch arm64 -arch arm64e -shared -o CameraRollPicker.dylib \
-//   CameraRollPicker.m -framework Foundation -framework UIKit \
-//   -framework PhotosUI -framework AVFoundation -framework WebKit -fobjc-arc
+// DIAGNOSTIC BUILD (with Files-app fallback path)
+// Detects which camera pipeline the host app uses and writes a
+// log to BOTH the app's Documents folder and a fallback path
+// under the app's Library folder, printing the absolute path
+// to the console so it can be retrieved via idevicesyslog.
 // ============================================================
 
 #import <Foundation/Foundation.h>
@@ -22,17 +14,108 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
+// ============================================================
+// LOG FILE SETUP (with fallback)
+// ============================================================
+static NSString *gLogPath = nil;
+static NSLock *gLogLock = nil;
+
+static void initLogPath(void) {
+    if (gLogPath) return;
+    gLogLock = [[NSLock alloc] init];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *docPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docs = docPaths.firstObject;
+
+    BOOL wrote = NO;
+    if (docs) {
+        NSString *p = [docs stringByAppendingPathComponent:@"CameraRollPicker.log"];
+        if (![fm fileExistsAtPath:p]) {
+            wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+        } else {
+            wrote = YES;
+        }
+        if (wrote) gLogPath = p;
+    }
+
+    // Fallback 1: Library/Logs
+    if (!wrote) {
+        NSArray *libPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSString *lib = libPaths.firstObject;
+        if (lib) {
+            NSString *logsDir = [lib stringByAppendingPathComponent:@"Logs"];
+            [fm createDirectoryAtPath:logsDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *p = [logsDir stringByAppendingPathComponent:@"CameraRollPicker.log"];
+            if (![fm fileExistsAtPath:p]) {
+                wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+            } else {
+                wrote = YES;
+            }
+            if (wrote) gLogPath = p;
+        }
+    }
+
+    // Fallback 2: tmp
+    if (!wrote) {
+        NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"CameraRollPicker.log"];
+        if (![fm fileExistsAtPath:p]) {
+            wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+        } else {
+            wrote = YES;
+        }
+        if (wrote) gLogPath = p;
+    }
+
+    // Final: still nothing? use absolute path from bundle container
+    if (!gLogPath) {
+        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+        NSString *container = [NSString stringWithFormat:@"/var/mobile/Containers/Data/Application/%@/Documents/CameraRollPicker.log", bundleId];
+        gLogPath = container;
+    }
+
+    NSLog(@"[CameraRollPicker] LOG PATH = %@", gLogPath);
+    // Print to stderr as well so it's captured even if NSLog is filtered
+    fprintf(stderr, "[CameraRollPicker] LOG PATH = %s\n", gLogPath.UTF8String);
+}
+
+static void CRLog(NSString *format, ...) {
+    initLogPath();
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [NSDate date].description, msg];
+
+    [gLogLock lock];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    }
+    [gLogLock unlock];
+
+    NSLog(@"[CameraRollPicker] %@", msg);
+    fprintf(stderr, "[CameraRollPicker] %s\n", msg.UTF8String);
+}
+
+// ============================================================
+// GLOBALS
+// ============================================================
 static UIImagePickerController *gActiveImagePicker = nil;
 static id gActiveImagePickerDelegate = nil;
 static AVCapturePhotoOutput *gActivePhotoOutput = nil;
+static AVCaptureSession *gActiveSession = nil;
+static AVCaptureVideoDataOutput *gActiveVideoOutput = nil;
 static UIButton *gFloatingButton = nil;
 static id gActivePickerDelegate = nil;
 static UIImage *gLastPickedImage = nil;
-static NSURL *gLastPickedVideoURL = nil;
-static NSMutableArray *gPhotoSwapDelegates = nil;
 
 // ============================================================
-// 1. Top-most view controller
+// Top-most view controller
 // ============================================================
 static UIViewController *topViewController(void) {
     UIWindow *keyWindow = nil;
@@ -43,18 +126,22 @@ static UIViewController *topViewController(void) {
             }
         }
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (!keyWindow) keyWindow = [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
     UIViewController *vc = keyWindow.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
 
 // ============================================================
-// 2. Broadcast picked media to every known consumer
+// Deliver picked image
 // ============================================================
 static void deliverImage(UIImage *image) {
     if (!image) return;
     gLastPickedImage = image;
+    CRLog(@"PICKER returned image size=%.0fx%.0f", image.size.width, image.size.height);
 
     if (gActiveImagePicker && gActiveImagePickerDelegate &&
         [gActiveImagePickerDelegate respondsToSelector:@selector(imagePickerController:didFinishPickingMediaWithInfo:)]) {
@@ -68,66 +155,20 @@ static void deliverImage(UIImage *image) {
     }
     [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerImageSelected" object:image];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementImage" object:image];
-
-    // If a photo-output capture is active, trigger it so the wrapper fires
-    if (gActivePhotoOutput) {
-        @try {
-            AVCapturePhotoSettings *s = [AVCapturePhotoSettings photoSettings];
-            PhotoSwapDelegate *wrapper = [[PhotoSwapDelegate alloc] initWithOriginal:nil image:image];
-            if (!gPhotoSwapDelegates) gPhotoSwapDelegates = [NSMutableArray array];
-            [gPhotoSwapDelegates addObject:wrapper];
-            [gActivePhotoOutput capturePhotoWithSettings:s delegate:wrapper];
-        } @catch (NSException *e) {
-            NSLog(@"[CameraRollPicker] photo-output trigger failed: %@", e);
-        }
-    }
-}
-
-static void deliverVideo(NSURL *url) {
-    if (!url) return;
-    gLastPickedVideoURL = url;
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerVideoSelected" object:url];
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementVideo" object:url];
 }
 
 // ============================================================
-// 3. PhotoSwapDelegate – used by both hook C and manual trigger
-// ============================================================
-@interface PhotoSwapDelegate : NSObject <AVCapturePhotoCaptureDelegate>
-@property (nonatomic, weak) id<AVCapturePhotoCaptureDelegate> original;
-@property (nonatomic, strong) UIImage *replacement;
-@end
-
-@implementation PhotoSwapDelegate
-- (instancetype)initWithOriginal:(id<AVCapturePhotoCaptureDelegate>)orig image:(UIImage *)img {
-    if ((self = [super init])) { _original = orig; _replacement = img; }
-    return self;
-}
-- (void)captureOutput:(AVCapturePhotoOutput *)output didFinishProcessingPhoto:(AVCapturePhoto *)photo error:(NSError *)error {
-    if (self.replacement) {
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementImage" object:self.replacement];
-    }
-    if ([self.original respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
-        [self.original captureOutput:output didFinishProcessingPhoto:photo error:error];
-    }
-}
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    return [super respondsToSelector:aSelector] || [self.original respondsToSelector:aSelector];
-}
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    return [self.original respondsToSelector:aSelector] ? self.original : nil;
-}
-@end
-
-// ============================================================
-// 4. PHPicker delegate – images + videos
+// PHPicker delegate
 // ============================================================
 @interface CameraRollOverlayDelegate : NSObject <PHPickerViewControllerDelegate>
 @end
 @implementation CameraRollOverlayDelegate
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    if (results.count == 0) return;
+    if (results.count == 0) {
+        CRLog(@"PHPicker cancelled");
+        return;
+    }
     NSItemProvider *provider = results.firstObject.itemProvider;
     if ([provider canLoadObjectOfClass:[UIImage class]]) {
         [provider loadObjectOfClass:[UIImage class] completionHandler:^(UIImage *img, NSError *err) {
@@ -136,14 +177,15 @@ static void deliverVideo(NSURL *url) {
     } else if ([provider hasItemConformingToTypeIdentifier:@"public.movie"]) {
         [provider loadItemForTypeIdentifier:@"public.movie" options:nil completionHandler:^(id item, NSError *err) {
             NSURL *url = [item isKindOfClass:[NSURL class]] ? item : [NSURL URLWithString:[item description]];
-            dispatch_async(dispatch_get_main_queue(), ^{ deliverVideo(url); });
+            CRLog(@"PHPicker returned video URL=%@", url);
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerVideoSelected" object:url];
         }];
     }
 }
 @end
 
 // ============================================================
-// 5. Floating button with re-attach across ALL page transitions
+// Floating button
 // ============================================================
 static void installFloatingButton(void);
 static void reattachFloatingButton(void) {
@@ -186,6 +228,7 @@ static void installFloatingButton(void) {
     gFloatingButton.titleLabel.font = [UIFont systemFontOfSize:26];
 
     UIAction *action = [UIAction actionWithHandler:^(__kindof UIAction *a) {
+        CRLog(@"Floating button tapped – opening PHPicker");
         PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
         cfg.filter = [PHPickerFilter anyFilterMatchingSubfilters:@[[PHPickerFilter imagesFilter], [PHPickerFilter videosFilter]]];
         cfg.selectionLimit = 1;
@@ -199,7 +242,7 @@ static void installFloatingButton(void) {
 }
 
 // ============================================================
-// 6. HOOK A: UIImagePickerController presentation (legacy camera)
+// HOOK A: UIImagePickerController
 // ============================================================
 @interface UIViewController (CameraRollHook)
 @end
@@ -216,6 +259,7 @@ static void installFloatingButton(void) {
 - (void)swz_presentViewController:(UIViewController *)vc animated:(BOOL)a completion:(void (^)(void))c {
     if ([vc isKindOfClass:[UIImagePickerController class]]) {
         UIImagePickerController *p = (UIImagePickerController *)vc;
+        CRLog(@"DETECTED UIImagePickerController presented sourceType=%ld", (long)p.sourceType);
         if (p.sourceType == UIImagePickerControllerSourceTypeCamera) {
             gActiveImagePicker = p;
             gActiveImagePickerDelegate = p.delegate;
@@ -226,7 +270,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 7. HOOK B: AVCapturePhotoOutput tracking + capture interception
+// HOOK B: AVCapturePhotoOutput
 // ============================================================
 @interface AVCapturePhotoOutput (CameraRollHook)
 @end
@@ -248,27 +292,20 @@ static void installFloatingButton(void) {
 }
 - (instancetype)swz_init {
     id obj = [self swz_init];
-    if (obj) gActivePhotoOutput = obj;
+    if (obj) {
+        gActivePhotoOutput = obj;
+        CRLog(@"DETECTED AVCapturePhotoOutput init");
+    }
     return obj;
 }
 - (void)swz_capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
-    if (gLastPickedImage && delegate) {
-        UIImage *img = gLastPickedImage;
-        gLastPickedImage = nil;
-        PhotoSwapDelegate *wrapper = [[PhotoSwapDelegate alloc] initWithOriginal:delegate image:img];
-        if (!gPhotoSwapDelegates) gPhotoSwapDelegates = [NSMutableArray array];
-        [gPhotoSwapDelegates addObject:wrapper];
-        [self swz_capturePhotoWithSettings:settings delegate:wrapper];
-        return;
-    }
+    CRLog(@"DETECTED AVCapturePhotoOutput capturePhotoWithSettings delegate=%@", delegate);
     [self swz_capturePhotoWithSettings:settings delegate:delegate];
 }
 @end
 
 // ============================================================
-// 8. HOOK C: AVCaptureVideoDataOutput / AVCaptureSession custom camera
-//    Intercept session start and expose notification so custom UIs
-//    can be fed the replacement image immediately.
+// HOOK C: AVCaptureSession
 // ============================================================
 @interface AVCaptureSession (CameraRollHook)
 @end
@@ -280,23 +317,58 @@ static void installFloatingButton(void) {
         Method m1 = class_getInstanceMethod(cls, @selector(startRunning));
         Method m2 = class_getInstanceMethod(cls, @selector(swz_startRunning));
         if (m1 && m2) method_exchangeImplementations(m1, m2);
+
+        Method m3 = class_getInstanceMethod(cls, @selector(addOutput:));
+        Method m4 = class_getInstanceMethod(cls, @selector(swz_addOutput:));
+        if (m3 && m4) method_exchangeImplementations(m3, m4);
     });
 }
 - (void)swz_startRunning {
+    gActiveSession = self;
+    CRLog(@"DETECTED AVCaptureSession startRunning (session=%@)", self);
     [self swz_startRunning];
-    if (gLastPickedImage) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementImage" object:gLastPickedImage];
-        });
-    }
+}
+- (void)swz_addOutput:(AVCaptureOutput *)output {
+    CRLog(@"DETECTED AVCaptureSession addOutput class=%@", NSStringFromClass([output class]));
+    [self swz_addOutput:output];
 }
 @end
 
 // ============================================================
-// 9. HOOK D: WKWebView file input (capture)
-//    On iOS 14+, WKWebView uses _WKFileUploadPanel internally. We
-//    intercept the picker presentation and inject our image data
-//    as the selected file result.
+// HOOK D: AVCaptureVideoDataOutput
+// ============================================================
+@interface AVCaptureVideoDataOutput (CameraRollHook)
+@end
+@implementation AVCaptureVideoDataOutput (CameraRollHook)
++ (void)load {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = [AVCaptureVideoDataOutput class];
+        Method m1 = class_getInstanceMethod(cls, @selector(setSampleBufferDelegate:queue:));
+        Method m2 = class_getInstanceMethod(cls, @selector(swz_setSampleBufferDelegate:queue:));
+        if (m1 && m2) method_exchangeImplementations(m1, m2);
+
+        Method m3 = class_getInstanceMethod(cls, @selector(init));
+        Method m4 = class_getInstanceMethod(cls, @selector(swz_init));
+        if (m3 && m4) method_exchangeImplementations(m3, m4);
+    });
+}
+- (instancetype)swz_init {
+    id obj = [self swz_init];
+    if (obj) {
+        gActiveVideoOutput = obj;
+        CRLog(@"DETECTED AVCaptureVideoDataOutput init");
+    }
+    return obj;
+}
+- (void)swz_setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
+    CRLog(@"DETECTED AVCaptureVideoDataOutput setSampleBufferDelegate delegate=%@", delegate);
+    [self swz_setSampleBufferDelegate:delegate queue:queue];
+}
+@end
+
+// ============================================================
+// HOOK E: WKWebView file upload
 // ============================================================
 @interface WKWebView (CameraRollHook)
 @end
@@ -305,18 +377,24 @@ static void installFloatingButton(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class cls = NSClassFromString(@"_WKFileUploadPanel");
-        if (!cls) return;
+        if (!cls) {
+            CRLog(@"NOTE _WKFileUploadPanel not present in this runtime");
+            return;
+        }
         SEL orig = NSSelectorFromString(@"_presentForFileUploadFromRect:withAllowedTypes:");
         SEL swiz = NSSelectorFromString(@"swz_presentForFileUploadFromRect:withAllowedTypes:");
         Method m1 = class_getInstanceMethod(cls, orig);
         Method m2 = class_getInstanceMethod(cls, swiz);
-        if (m1 && m2) method_exchangeImplementations(m1, m2);
+        if (m1 && m2) {
+            method_exchangeImplementations(m1, m2);
+            CRLog(@"HOOK E installed on _WKFileUploadPanel");
+        }
     });
 }
 @end
 
 // ============================================================
-// 10. HOOK E: UIDocumentPickerViewController – override result
+// HOOK F: UIDocumentPickerViewController
 // ============================================================
 @interface UIDocumentPickerViewController (CameraRollHook)
 @end
@@ -325,30 +403,19 @@ static void installFloatingButton(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         Class cls = [UIDocumentPickerViewController class];
-        SEL orig = @selector(initForOpeningContentTypes:asCopy:);
-        SEL swiz = @selector(swz_initForOpeningContentTypes:asCopy:);
-        Method m1 = class_getInstanceMethod(cls, orig);
-        Method m2 = class_getInstanceMethod(cls, swiz);
+        Method m1 = class_getInstanceMethod(cls, @selector(initForOpeningContentTypes:asCopy:));
+        Method m2 = class_getInstanceMethod(cls, @selector(swz_initForOpeningContentTypes:asCopy:));
         if (m1 && m2) method_exchangeImplementations(m1, m2);
     });
 }
 - (instancetype)swz_initForOpeningContentTypes:(NSArray<UTType *> *)types asCopy:(BOOL)asCopy {
-    id obj = [self swz_initForOpeningContentTypes:types asCopy:asCopy];
-    if (obj && gLastPickedImage) {
-        // Override the document picker to immediately resolve with our image
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSData *png = UIImagePNGRepresentation(gLastPickedImage);
-            NSURL *tmp = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"picked.png"]];
-            [png writeToURL:tmp atomically:YES];
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementFile" object:tmp];
-        });
-    }
-    return obj;
+    CRLog(@"DETECTED UIDocumentPickerViewController init types=%@", types);
+    return [self swz_initForOpeningContentTypes:types asCopy:asCopy];
 }
 @end
 
 // ============================================================
-// 11. Keep button on top across ALL transitions
+// FloatingButtonFollow
 // ============================================================
 @interface UIViewController (FloatingButtonFollow)
 @end
@@ -376,10 +443,10 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// 12. Install on launch
+// Entry
 // ============================================================
 __attribute__((constructor)) static void initCameraRollPicker(void) {
-    NSLog(@"[CameraRollPicker] Loaded – universal camera-input replacement.");
+    CRLog(@"=== CameraRollPicker DIAGNOSTIC BUILD loaded ===");
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             installFloatingButton();
