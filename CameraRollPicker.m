@@ -1,10 +1,23 @@
 // ============================================================
 // CameraRollPicker.m
-// DIAGNOSTIC BUILD (with Files-app fallback path)
-// Detects which camera pipeline the host app uses and writes a
-// log to BOTH the app's Documents folder and a fallback path
-// under the app's Library folder, printing the absolute path
-// to the console so it can be retrieved via idevicesyslog.
+// Universal camera-input replacement for iOS sideloaded apps.
+//
+// Confirmed working path: the host app uses a custom
+// AVCaptureSession with an AVCaptureVideoDataOutput whose
+// delegate is Persona2.SelfieVisionHandler. This build wraps
+// that delegate with a proxy that substitutes the live
+// CMSampleBuffer with a CMSampleBuffer built from the image
+// picked via the floating green button (PHPicker).
+//
+// Also retains diagnostic logging for the other pipeline
+// types (UIImagePickerController, AVCapturePhotoOutput,
+// WKWebView, UIDocumentPicker) so you can see in the log
+// which paths are active.
+//
+// Compile: clang -arch arm64 -arch arm64e -shared -o CameraRollPicker.dylib \
+//   CameraRollPicker.m -framework Foundation -framework UIKit \
+//   -framework PhotosUI -framework AVFoundation -framework WebKit \
+//   -framework UniformTypeIdentifiers -fobjc-arc
 // ============================================================
 
 #import <Foundation/Foundation.h>
@@ -12,10 +25,12 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #import <WebKit/WebKit.h>
+#import <CoreVideo/CoreVideo.h>
+#import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 
 // ============================================================
-// LOG FILE SETUP (with fallback)
+// LOG FILE SETUP (Documents -> Library/Logs -> tmp -> absolute)
 // ============================================================
 static NSString *gLogPath = nil;
 static NSLock *gLogLock = nil;
@@ -27,19 +42,14 @@ static void initLogPath(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *docPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docs = docPaths.firstObject;
-
     BOOL wrote = NO;
+
     if (docs) {
         NSString *p = [docs stringByAppendingPathComponent:@"CameraRollPicker.log"];
-        if (![fm fileExistsAtPath:p]) {
-            wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
-        } else {
-            wrote = YES;
-        }
+        if (![fm fileExistsAtPath:p]) wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+        else wrote = YES;
         if (wrote) gLogPath = p;
     }
-
-    // Fallback 1: Library/Logs
     if (!wrote) {
         NSArray *libPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
         NSString *lib = libPaths.firstObject;
@@ -47,35 +57,17 @@ static void initLogPath(void) {
             NSString *logsDir = [lib stringByAppendingPathComponent:@"Logs"];
             [fm createDirectoryAtPath:logsDir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *p = [logsDir stringByAppendingPathComponent:@"CameraRollPicker.log"];
-            if (![fm fileExistsAtPath:p]) {
-                wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
-            } else {
-                wrote = YES;
-            }
+            if (![fm fileExistsAtPath:p]) wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+            else wrote = YES;
             if (wrote) gLogPath = p;
         }
     }
-
-    // Fallback 2: tmp
     if (!wrote) {
         NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"CameraRollPicker.log"];
-        if (![fm fileExistsAtPath:p]) {
-            wrote = [fm createFileAtPath:p contents:[NSData data] attributes:nil];
-        } else {
-            wrote = YES;
-        }
-        if (wrote) gLogPath = p;
+        if (![fm fileExistsAtPath:p]) [fm createFileAtPath:p contents:[NSData data] attributes:nil];
+        gLogPath = p;
     }
-
-    // Final: still nothing? use absolute path from bundle container
-    if (!gLogPath) {
-        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-        NSString *container = [NSString stringWithFormat:@"/var/mobile/Containers/Data/Application/%@/Documents/CameraRollPicker.log", bundleId];
-        gLogPath = container;
-    }
-
     NSLog(@"[CameraRollPicker] LOG PATH = %@", gLogPath);
-    // Print to stderr as well so it's captured even if NSLog is filtered
     fprintf(stderr, "[CameraRollPicker] LOG PATH = %s\n", gLogPath.UTF8String);
 }
 
@@ -85,10 +77,7 @@ static void CRLog(NSString *format, ...) {
     va_start(args, format);
     NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                      [NSDate date].description, msg];
-
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date].description, msg];
     [gLogLock lock];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
     if (fh) {
@@ -97,7 +86,6 @@ static void CRLog(NSString *format, ...) {
         [fh closeFile];
     }
     [gLogLock unlock];
-
     NSLog(@"[CameraRollPicker] %@", msg);
     fprintf(stderr, "[CameraRollPicker] %s\n", msg.UTF8String);
 }
@@ -136,13 +124,123 @@ static UIViewController *topViewController(void) {
 }
 
 // ============================================================
-// Deliver picked image
+// Sample-buffer factory: UIImage -> CMSampleBuffer (BGRA)
+// ============================================================
+static CMSampleBufferRef CRSampleBufferFromImage(UIImage *image) {
+    if (!image) return NULL;
+    CGImageRef cg = image.CGImage;
+    if (!cg) return NULL;
+    size_t w = CGImageGetWidth(cg);
+    size_t h = CGImageGetHeight(cg);
+
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+    };
+    CVPixelBufferRef px = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                        kCVPixelFormatType_32BGRA,
+                        (__bridge CFDictionaryRef)attrs, &px);
+    if (!px) return NULL;
+
+    CVPixelBufferLockBaseAddress(px, 0);
+    void *base = CVPixelBufferGetBaseAddress(px);
+    size_t bpr = CVPixelBufferGetBytesPerRow(px);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(px, 0);
+
+    CMVideoFormatDescriptionRef fmt = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, px, &fmt);
+
+    CMSampleTimingInfo timing = {
+        .duration = kCMTimeInvalid,
+        .presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock()),
+        .decodeTimeStamp = kCMTimeInvalid
+    };
+    CMSampleBufferRef sbuf = NULL;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, px, true,
+                                       NULL, NULL, fmt, &timing, &sbuf);
+    CVPixelBufferRelease(px);
+    if (fmt) CFRelease(fmt);
+    return sbuf;
+}
+
+// ============================================================
+// Video pipeline proxy: substitutes the camera frame with the
+// picked image. Installed via AVCaptureVideoDataOutput hook.
+// ============================================================
+@class CRVideoProxy;
+
+@interface CRVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> original;
+@property (atomic, strong) UIImage *replacement;
+@end
+
+@implementation CRVideoProxy
+- (void)captureOutput:(AVCaptureOutput *)output
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+    UIImage *img = self.replacement;
+    if (img) {
+        CMSampleBufferRef fake = CRSampleBufferFromImage(img);
+        if (fake) {
+            if ([self.original respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                [self.original captureOutput:output
+                        didOutputSampleBuffer:fake
+                             fromConnection:connection];
+            }
+            CFRelease(fake);
+            return;
+        }
+    }
+    if ([self.original respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [self.original captureOutput:output
+                didOutputSampleBuffer:sampleBuffer
+                     fromConnection:connection];
+    }
+}
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    return [super respondsToSelector:aSelector] || [self.original respondsToSelector:aSelector];
+}
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    return [self.original respondsToSelector:aSelector] ? self.original : nil;
+}
+@end
+
+static CRVideoProxy *gVideoProxy = nil;
+
+// ============================================================
+// Resize helper (matches session resolution)
+// ============================================================
+static UIImage *CRResize(UIImage *img, CGSize target) {
+    if (!img) return nil;
+    UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
+    [img drawInRect:CGRectMake(0, 0, target.width, target.height)];
+    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return out ?: img;
+}
+
+// ============================================================
+// Deliver picked image into ALL channels
 // ============================================================
 static void deliverImage(UIImage *image) {
     if (!image) return;
     gLastPickedImage = image;
-    CRLog(@"PICKER returned image size=%.0fx%.0f", image.size.width, image.size.height);
 
+    // 1) Inject into live video pipeline if active
+    if (gVideoProxy) {
+        gVideoProxy.replacement = CRResize(image, CGSizeMake(1179, 2556));
+        CRLog(@"PICKER injected image into video pipeline (resized 1179x2556)");
+    }
+
+    // 2) Forward to UIImagePickerController delegate (if any)
     if (gActiveImagePicker && gActiveImagePickerDelegate &&
         [gActiveImagePickerDelegate respondsToSelector:@selector(imagePickerController:didFinishPickingMediaWithInfo:)]) {
         NSDictionary *info = @{
@@ -153,8 +251,12 @@ static void deliverImage(UIImage *image) {
             imagePickerController:gActiveImagePicker
             didFinishPickingMediaWithInfo:info];
     }
+
+    // 3) Broadcast notifications for any custom consumer
     [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerImageSelected" object:image];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"CameraRollPickerReplacementImage" object:image];
+
+    CRLog(@"PICKER returned image size=%.0fx%.0f", image.size.width, image.size.height);
 }
 
 // ============================================================
@@ -335,7 +437,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// HOOK D: AVCaptureVideoDataOutput
+// HOOK D: AVCaptureVideoDataOutput – install proxy delegate
 // ============================================================
 @interface AVCaptureVideoDataOutput (CameraRollHook)
 @end
@@ -363,7 +465,9 @@ static void installFloatingButton(void) {
 }
 - (void)swz_setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
     CRLog(@"DETECTED AVCaptureVideoDataOutput setSampleBufferDelegate delegate=%@", delegate);
-    [self swz_setSampleBufferDelegate:delegate queue:queue];
+    if (!gVideoProxy) gVideoProxy = [[CRVideoProxy alloc] init];
+    gVideoProxy.original = delegate;
+    [self swz_setSampleBufferDelegate:gVideoProxy queue:queue];
 }
 @end
 
@@ -415,7 +519,7 @@ static void installFloatingButton(void) {
 @end
 
 // ============================================================
-// FloatingButtonFollow
+// FloatingButtonFollow – keep button on top across transitions
 // ============================================================
 @interface UIViewController (FloatingButtonFollow)
 @end
@@ -446,7 +550,7 @@ static void installFloatingButton(void) {
 // Entry
 // ============================================================
 __attribute__((constructor)) static void initCameraRollPicker(void) {
-    CRLog(@"=== CameraRollPicker DIAGNOSTIC BUILD loaded ===");
+    CRLog(@"=== CameraRollPicker UNIVERSAL BUILD loaded ===");
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             installFloatingButton();
