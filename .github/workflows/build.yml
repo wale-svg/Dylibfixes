@@ -44,6 +44,9 @@ jobs:
             -framework AVFoundation \
             -framework WebKit \
             -framework UniformTypeIdentifiers \
+            -framework CoreGraphics \
+            -framework CoreMedia \
+            -framework CoreVideo \
             -fobjc-arc
 
       # 4. Compile arm64e slice
@@ -61,6 +64,9 @@ jobs:
             -framework AVFoundation \
             -framework WebKit \
             -framework UniformTypeIdentifiers \
+            -framework CoreGraphics \
+            -framework CoreMedia \
+            -framework CoreVideo \
             -fobjc-arc
 
       # 5. Merge into universal (fat) dylib
